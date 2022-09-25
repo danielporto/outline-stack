@@ -1,0 +1,26 @@
+## DYNAMIC CONFIG
+
+http:
+  routers:
+    to-dashboard:
+      service: api@internal
+      rule: Host(`traefik.{{ env "DOMAIN" }}`)
+      entrypoints:
+        - websecure
+      middlewares:
+        - auth
+      tls:
+        certResolver: letsencrypt
+        # configuration for dns challeng wildcard        
+        domains:
+          - main: '{{ env "DOMAIN" }}'
+            sans: 
+              - '*.{{ env "DOMAIN" }}'
+
+  
+  middlewares:
+    auth:
+      basicAuth:
+        users:
+          - {{ env "TRAEFIK_USER" }}:{{ env "TRAEFIK_PASSWORD_HASH" }}
+    

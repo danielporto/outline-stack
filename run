@@ -1,0 +1,1189 @@
+#!/usr/bin/env bash
+
+set -eo pipefail
+
+DC="${DC:-exec}"
+
+# If we're running in CI we need to disable TTY allocation for docker-compose
+# commands that enable it by default, such as exec and run.
+TTY=""
+if [[ ! -t 1 ]]; then
+    TTY="-T"
+fi
+
+# -----------------------------------------------------------------------------
+# load environment variables if they are available
+# required for CICD to load the CONTAINER_TAG
+# and to log in to AWS ECR and download images
+# -----------------------------------------------------------------------------
+set -a
+if [ -f .porto ]; then 
+	ENVIRONMENT=$(cat .porto)
+	if [ "${ENVIRONMENT}" = 'DEVELOPMENT' ]; then 
+		. .envfile-dev
+	elif [ "${ENVIRONMENT}" = 'LOCAL' ]; then 
+		. .envfile-local
+	elif [ "${ENVIRONMENT}" = 'STAGE' ]; then 
+		. .envfile-stage
+	elif [ "${ENVIRONMENT}" = 'PRODUCTION' ]; then 
+		. .envfile-prod
+	else 
+		echo "Environment target is not defined yet"; 
+		exit
+	fi
+	# echo "Environment: ${ENVIRONMENT}"
+fi;
+set +a
+
+# -----------------------------------------------------------------------------
+# VARIABLES
+# -----------------------------------------------------------------------------
+STACK_NAME=infra
+NETWORKS=('net_portainer' 'net_traefik' 'net_backend') #array
+REGISTER="docker.io"
+CONTAINERS_TO_BUILD=("${REGISTER}/porto-traefik") #array
+PATH_TO_CONTAINERS_TO_BUILD_CONTEXT=('traefik') # array
+# the PATH_TO_CONTAINERS_TO_BUILD_CONTEXT required for two reasons:
+# 1. it is a hack to overcome a bug with docker-compose.
+# docker-compose demands the context dir of the containers to exist
+# even when they are not used, so we need to create empty paths 
+# to fullfil the requirements as in 
+# https://stackoverflow.com/questions/43354652/can-docker-compose-skip-build-if-the-image-is-present
+# that is an issue with CICD because the code is not present on the 
+# remote machines, where the envfile and compose files should be deployed.
+# 2. it is a hack to overcome another bug with buildx bake. To build multiarch
+# containers in the same way we build local ones with the docker-compose file
+# we need to use an utilitary command: "docker buildx bake -f docker-compose.prod.yaml". This command receives a compose file
+# just like the normal local docker-compose build process. However this feature is not
+# yet stable (buildx  v0.8.2) and it fails to push images to AWS ECR non-deterministically. 
+# Thus we use "docker buildx build" directly which requires identifing the docker-compose file
+# and setting envs but envs cannot be in a file, thus we need the directory where the Dockerfile is located
+# once docker buildx bake is stable enough we can clean up this code.
+CONTAINERS_TO_BUILD_VERSION_TAG="${CONTAINER_TAG:-latest}"
+CONTAINERS_TO_BUILD_RELEASE_TAG="${CONTAINER_RELEASE_TAG:-release.latest}"
+BUILD_ARGS=""
+DOCKER_BUILDKIT=1
+VOLUMES=("vol_portainer" "vol_gateway_certs" "vol_storage" "vol_postgres" "vol_redis") #array
+# -----------------------------------------------------------------------------
+# Helper functions start with _ and aren't listed in this script's help menu.
+# -----------------------------------------------------------------------------
+# this funcion is required for CICD where we use docker command instead of compose files.
+# translate the container to the corresponding dockerfile for the environment
+# args: container_name environment
+# ex. _container_to_dockerfile ${REGISTER}/database dev
+# will return the dockerfile corresponding to the dev environment of the database container
+function _container_to_dockerfile {
+	CONTAINER="$1"
+	ENVIRONMENT="$2"
+
+	if [ -z "$CONTAINER" ] || [ -z "$ENVIRONMENT" ]; then 
+		echo "Arguments requried are empty."
+		exit 1;
+	fi
+
+	case "${CONTAINER}" in 
+		"${REGISTER}/porto-traefik")
+			# all scenarios use the same container
+			echo "Dockerfile";
+		;;
+		*)
+			echo "Unknown Container: ${CONTAINER}"; 
+			exit 1;
+
+		;;
+	esac	
+	
+
+}
+
+# this funcion is required for CICD where we use docker command instead of compose files.
+# translate the container to the corresponding envfile for the environment
+# args: container_name environment
+# ex. _container_to_dockerfile ${REGISTER}/database dev
+# will return the envfile corresponding to the dev environment of the database container
+function _container_to_envfile {
+	CONTAINER="$1"
+	ENVIRONMENT="$2"
+
+	if [ -z "$CONTAINER" ] || [ -z "$ENVIRONMENT" ]; then 
+		echo "Arguments requried are empty."
+		exit 1;
+	fi
+
+	case "${CONTAINER}" in 
+		"${REGISTER}/porto-traefik")
+			if [[ "${ENVIRONMENT}" =~ "dev" ]]; 	then echo ".envfile-dev";
+			elif [[ "${ENVIRONMENT}" =~ "local" ]]; then echo ".envfile-local";
+			elif [[ "${ENVIRONMENT}" =~ "stage" ]]; then echo ".envfile-stage";
+			elif [[ "${ENVIRONMENT}" =~ "prod" ]];  then echo ".envfile-prod";
+			else
+				echo "Unknown environment"; 
+				exit 1;
+			fi
+		;;
+		*)
+			echo "Unknown Container: ${CONTAINER}"; 
+			exit 1;
+
+		;;
+	esac	
+}
+
+
+# gets a container name in the format: register/aaa/aa/container and return only container
+# ex:
+# 570160826209.dkr.ecr.eu-west-1.amazonaws.com/porto-traefik -> porto-traefik
+function _container-name {
+	# printf "captures container name"
+	# echo "$1" | rev | cut -d '/' -f 1 | rev
+	container=$1
+# https://mywiki.wooledge.org/BashFAQ/100
+	echo "${container##*/}"
+}
+
+function _build-container-tag {
+	echo "$(git rev-parse --abbrev-ref HEAD).$(git rev-parse --short HEAD)"
+}
+
+#https://github.com/Adiii717/aws-cli-cheatsheet
+function aws-login { ## login into AWS Register (access private porto images)
+	docker logout
+	export AWS_ACCESS_KEY_ID="${AWS_ECR_RO_ACCESS_KEY_ID}"
+	export AWS_SECRET_ACCESS_KEY="${AWS_ECR_RO_SECRET_ACCESS_KEY}"
+	export AWS_DEFAULT_REGION="${AWS_ECR_RO_DEFAULT_REGION}"
+	aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${REGISTER}
+}
+
+function _aws-list-images { 
+	# list images at the registry
+	aws ecr describe-repositories --query "repositories[].repositoryName" --output yaml
+}
+
+function _aws-list-image-tags { 
+	# <image> list the versions/tags of an image at the registry
+	aws ecr list-images --repository-name $1 --query "imageIds[].imageTag" --output yaml
+	# aws ecr describe-images --repository-name $1  --output yaml # use this for debug
+}
+
+function aws-list-all-images { ## list all porto images available at ECR [--inline]
+
+	for i in $(_aws-list-images |  cut -d " " -f 2); do 
+		if [[ " $@ " =~ " --inline " ]]; then 
+			# transform command output into an array
+			mapfile -t TAGS <<< "$(_aws-list-image-tags ${i})"
+			for j in "${TAGS[@]}"; do
+				echo "${i} ${j}"
+			done;
+		else
+			echo "IMAGE: ${i} ==================================="
+			_aws-list-image-tags $i
+		fi
+	done;
+} 
+
+# read an env file and convert to a string --args used by docker
+# to pass envs 
+function _envfile_to_docker_args {
+	DOCKERVARS=""
+	# echo "$1"
+	mapfile -t ENVVARS <<< $(cat "$1" | grep -v "^#" | grep -v "^$")
+	for j in "${ENVVARS[@]}"; do
+		# echo "${j}"
+		DOCKERVARS="$DOCKERVARS --build-arg ${j}"
+	done;
+	echo "${DOCKERVARS}"
+}
+
+
+function aws-logout { ## logout AWS Register
+	docker logout
+}
+
+function aws-pull-images { ## cache images of containers built and published
+
+	# CONTAINER_TAG="$(_build-container-tag)"
+	for IMAGE in "${CONTAINERS_TO_BUILD[@]}"; do
+		docker pull "${IMAGE}:${CONTAINER_TAG}"
+	done;
+
+}
+
+function check-if-images-exists { ## When a job re-run, we can skip recriating the images
+	# this call may create two files, /tmp/porto-images.skip and /tmp/porto-images.build
+	# to store the state of CONTAINERS_TO_BUILD
+	# if no file are build, the skip file wont be created. converselly if all files are
+	# already built, no skip file is created.
+
+	# this can either fail due to problems with aws
+	# return if container that require rebuild
+	# return that rebuild is not necessary
+
+	# cache all available images:
+	aws-list-all-images --inline > /tmp/porto-images.list
+	# clean results
+	rm -f /tmp/porto-images.skip
+	rm -f /tmp/porto-images.build
+
+	# CONTAINER_TAG=$(git rev-parse --abbrev-ref HEAD).$(git rev-parse --short HEAD)
+	for IMAGE in "${CONTAINERS_TO_BUILD[@]}"; do
+		IMAGE_NAME=$(_container-name "$IMAGE")
+		echo "Check for ${IMAGE_NAME}:${CONTAINER_TAG}"
+		
+		# every image has a repository with multiple image versions
+		if [ -n "$(cat /tmp/porto-images.list | grep -F ${IMAGE_NAME} | grep -F "${CONTAINER_TAG}")" ]; then 
+			echo "Image ${IMAGE_NAME}:${CONTAINER_TAG} has being found. SKIP IT."
+			echo "${IMAGE_NAME}:${CONTAINER_TAG}" >> /tmp/porto-images.skip
+		else 
+			echo "Image ${IMAGE_NAME}:${CONTAINER_TAG} not found. BUILD IT."
+			echo "${IMAGE_NAME}:${CONTAINER_TAG}" >> /tmp/porto-images.build
+		fi
+		
+	done;
+}
+
+function _dc {
+    docker-compose "${DC}" ${TTY} "${@}"
+}
+
+# validate that the swarm stack is ready to deploy
+function _check-stack {
+	rm -f .error
+	SWARM_STATUS=$(docker info | grep Swarm | cut -d " " -f 3)
+	if [ ! "${SWARM_STATUS}" = "active" ]; then 
+		echo "Swarm is not active" >> .error; 
+	fi;
+
+	if [ ${#NETWORKS[@]} -gt 0 ]; then 
+		for NET in "${NETWORKS[@]}"; do 
+			NET_STATUS=$(docker network ls | awk /$NET/)
+			if [ -n "${NET_STATUS}" ]; then 
+				if grep -q "overlay" <<< "${NET_STATUS}"; then 
+					echo "Network already exists: ${NET_STATUS}" ;
+				else 
+					echo "Error, network [${NET}] exist but it is not overlay" >> .error ;
+				fi ;
+			else 
+				echo "Error, network [${NET}] does not exist" >> .error ;
+			fi; 
+		done; 
+	fi; 
+
+	if [ -f .error ]; then 
+		cat .error
+		exit 1;
+	fi;
+	echo "Swarm stack is ok!"
+
+}
+
+# clean remove exactly the resource name specified at the top of this file
+# its always safe to use. It wont remove items from running containers for safety
+function _clean-volumes { 
+	if [ ${#VOLUMES[@]} -eq 0 ]; then 
+		echo "No volumes to remove"; 
+		return; 
+	fi;
+	
+	for VOL in "${VOLUMES[@]}";  do 
+		if [ -n "$(docker volume ls | grep -F ${VOL} 2>/dev/null)"  ]; then  
+			echo "REMOVING $VOL"
+			docker volume ls -q | grep -F "${VOL}" | xargs docker volume rm; 
+		else 
+			echo "${VOL} is already removed."; 
+		fi;  
+	done; 
+}
+
+function _clean-networks {
+	if [ "${#NETWORKS[*]}" -eq 0 ]; then 
+		echo "No Networks to remove"; 
+		return; 
+	fi;
+	# echo "DEBUG ${#NETWORKS[*]}"
+
+	for NET in "${NETWORKS[@]}"; do
+		NET_STATUS=$(docker network ls | awk "/${NET}/")
+		if [ -n "${NET_STATUS}" ]; then 
+			echo "REMOVING $NET"
+			docker network rm ${NET} ;
+		else 
+			echo "${NET} is already removed."; 
+		fi; 
+	done; 
+}
+
+function _clean-images {
+	for CONTAINER in "${CONTAINERS_TO_BUILD[@]}";  do 
+		if [ -n "$(docker image ls | grep -F ${CONTAINER})"  ]; then 
+			echo "REMOVING $CONTAINER"
+			docker rmi "${CONTAINER}:${CONTAINERS_TO_BUILD_VERSION_TAG}"; 
+		else 
+			echo "image ${CONTAINER}:${CONTAINERS_TO_BUILD_VERSION_TAG} is already removed."; 
+		fi; 
+	done;
+}
+
+# Purge uses regex to remove all resources that includes the names of items 
+# specified at the top of this file, it removes volumes created by stack and compose
+# but may affect other items in the system.
+# It wont remove items from running containers for safety
+function _purge-volumes {
+	_clean-volumes
+	docker volume prune -f
+}
+
+function _purge-networks {
+	_clean-networks
+
+	SWARM_STATUS=$(docker info | grep Swarm | cut -d " " -f 3)
+	if [  "${SWARM_STATUS}" != "active" ]; then 
+		echo "Swarm is not active!" ;
+	else 
+		echo "Leaving swarm" ;
+		docker swarm leave --force ; 
+	fi;
+}
+
+# purge all images
+function _purge-images {
+
+	echo "Purge docker images....."
+	for CONTAINER in "${CONTAINERS_TO_BUILD[@]}";  do 
+		echo "Removing image ${CONTAINER}..."
+		# testing if the images exist are required otherwise cut will fail silently when images do not exists
+		if [ -n "$(docker image list --format 'table {{.ID}}\t{{.Repository}}\t{{.Tag}}\t{{.Size}}' | grep -F "${CONTAINER}")" ]; then 
+			docker image list --format 'table {{.ID}}\t{{.Repository}}\t{{.Tag}}\t{{.Size}}' | grep -F "${CONTAINER}" | cut -d " " -f 1 | xargs docker rmi
+		fi;
+	done;
+	echo "Docker images have been purged."
+}
+
+# -----------------------------------------------------------------------------
+# Public functions
+# -----------------------------------------------------------------------------
+function lint:dockerfile { ## lint dockerfile
+    docker container run --rm -i \
+    hadolint/hadolint hadolint --ignore DL3008 "${@}" - < Dockerfile
+}
+
+
+# -----------------------------------------------------------------------------
+# DEVELOPMENT environment functions
+# -----------------------------------------------------------------------------
+function env-dev {  ## Configure the script targets to use DEVELOPMENT setup
+    echo "DEVELOPMENT enviroment setup"
+    rm -f .error
+	envfiles=('.envfile-dev')
+	for f in "${envfiles[@]}"; do 
+		if [ ! -f ${f} ]; then
+			echo "[ERROR]: Missing required file ${f} file. Check the env.example and build one.";
+        touch .error;
+    fi;
+    done;
+	if [ -f .error ]; then echo "Error detected. check the .error file" ;exit 1; fi;
+       
+    # Development Certificate generation
+    CERTIFICATES=$(find certs | awk /pem/  |wc -l | cut -d ' ' -f 8)
+    DIR=$(pwd)
+    if [ ${CERTIFICATES} -gt 0 ]; then
+        echo "Certificates already exists, make sure they are installed in your System:"
+        echo "    Certificate path: ${DIR}/certs" ;
+    else
+        echo "Generating Development certificates" ;
+        docker run --rm  --env-file .envfile-dev -v ${DIR}/certs:/certs -w /certs --entrypoint /certs/generate-dev-certs.sh  -it nginx ;
+    fi;
+
+	SWARM_STATUS=$(docker info | grep Swarm | cut -d " " -f 3)
+	if [ "${SWARM_STATUS}" = "active" ]; then 
+		echo "Swarm is active - that creates conflicts with the dev deployment. Cleanup/Purge first." 
+		touch .error;
+	fi;
+
+    # Finish configurtion ------------------------------------------------
+    if [ ! -f .error ]; then
+        echo "DEVELOPMENT" >  .porto;
+        echo "DEVELOPMENT environment configured successfuly.";
+    else
+        echo "DEVELOPMENT environment configured FAILED.";
+    fi;
+
+}
+
+## build containers for local development
+function _dev-build { 
+	
+
+	echo "Build DEVELOPMENT containers"
+	if [[ " $@ " =~ " --rebuild " ]]; then 
+		DOCKER_BUILDKIT=${DOCKER_BUILDKIT} docker-compose --env-file .envfile-dev -f docker-compose.dev.yaml build --no-cache
+	else 
+		DOCKER_BUILDKIT=${DOCKER_BUILDKIT} docker-compose --env-file .envfile-dev -f docker-compose.dev.yaml build
+	fi
+	echo "Finished building images."
+
+	if [[ " $@ " =~ " --scan " ]]; then 
+		echo "--scan is not available for DEVELOPMENT environment. Only for LOCAL/STAGE/PRODUCTION."
+	fi
+}
+
+# stop containers, remove volumes and networks for this stack
+function _dev-clean { 
+	_dev-down 
+	_clean-volumes 
+	_clean-images 
+	_clean-networks
+	echo "DEVELOPMENT environment is clean"
+}
+
+# bring up the development stack and detach (check make dev-log)
+function _dev-up {
+ 	docker-compose --env-file .envfile-dev  -f docker-compose.dev.yaml up -d 
+}
+
+# bring down the development stack
+function _dev-down {
+	docker-compose --env-file .envfile-dev -f docker-compose.dev.yaml down
+}
+
+# # pause the development stack
+# dev-pause: 
+# 	@ docker-compose --env-file .envfile-dev pause
+
+# # continue the development stack
+# dev-continue: 
+# 	@ docker-compose --env-file .envfile-dev unpause
+
+# attach to a running stack
+function _dev-log {
+	docker-compose --env-file .envfile-dev -f docker-compose.dev.yaml logs -f
+}
+
+# print the resulting dockercompose file used to deploy the stack
+function _dev-debug {
+	docker-compose --env-file .envfile-dev -f docker-compose.dev.yaml config
+}
+
+
+# -----------------------------------------------------------------------------
+# LOCAL environment functions
+# -----------------------------------------------------------------------------
+function env-local { ## Configure the script targets to use LOCAL (uses swarm and prod containers with development envs)
+    echo "LOCAL enviroment setup"
+    rm -f .error
+	envfiles=('.envfile-local')
+	for f in $envfiles; do 
+		if [ ! -f ${f} ]; then
+			echo "[ERROR]: Missing required file ${f} file. Check the env.example and build one.";
+        touch .error;
+    	fi;
+		if [ $(cat "${f}" | wc -l | sed s/' '//g) -eq 0 ]; then  
+			echo "[ERROR]: file ${f} file is empty.";
+			touch .error;
+       fi;
+    done;
+    # LOCAL Certificate generation
+    CERTIFICATES=$(find certs | grep pem  |wc -l | cut -d ' ' -f 8)
+    DIR=$(pwd)
+    if [ ${CERTIFICATES} -gt 0 ]; then
+        echo "Certificates already exists, make sure they are installed in your System:"
+        echo "    Certificate path: ${DIR}/certs" ;
+    else
+        echo "Generating LOCAL certificates" ;
+        docker run --rm  --env-file .envfile-local -v ${DIR}/certs:/certs -w /certs --entrypoint /certs/generate-dev-certs.sh  -it nginx ;
+    fi;
+       
+    
+    # Finish configurtion ------------------------------------------------
+    if [ ! -f .error ]; then
+        echo "LOCAL" >  .porto;
+        echo "LOCAL environment configured successfuly.";
+    else
+        echo "LOCAL environment configured FAILED.";
+    fi;
+}
+
+function _local-provision { 
+	## Initialize swarm and create overlays
+	echo "Deploy ${STACK_NAME} stack"	
+	SWARM_STATUS=$(docker info | grep Swarm | cut -d " " -f 3)
+
+	if [  "${SWARM_STATUS}" = "inactive" ]; then 
+		echo "Activating docker swarm"; 
+		docker swarm init ;
+	elif [  "${SWARM_STATUS}" = "active" ]; then 
+		echo "Swarm is already active"; 
+	else 
+		echo "[ERROR]: Impossible to check docker swarm"; 
+		exit;
+	fi; 
+
+
+	echo "Creating networks"
+	if [ ${#NETWORKS[@]} -gt 0 ]; then 
+		for NET in "${NETWORKS[@]}"; do 
+			NET_STATUS=$(docker network ls | awk /$NET/)
+			# echo "NET: ${NET}"; 
+			# echo "netstatus: ${NET_STATUS}"; 
+			if [ -n "${NET_STATUS}" ]; then 
+				if grep -q "overlay" <<< "${NET_STATUS}"; then 
+					echo "Network already exists: ${NET_STATUS}" ;
+				else 
+					echo "Error, network is not overlay, remove it before deploy." ;
+					exit;
+				fi ;
+			else 
+				echo "Creating ${NET} network."; 
+				docker network create -d overlay --attachable ${NET} ;
+			fi; 
+		done; 
+	fi; 
+	echo "Environment is provisioned"
+
+	# prod-up: 
+	# 	@# all from stack manager
+	# 	@ docker network create -d overlay --attachable net_traefik
+	# 	@docker network create -d overlay --attachable --opt encrypted net_backend
+
+	# 	@# TODO below:
+	# 	@# define node roles
+	# 	@#docker node ls 
+	# 	@#docker node update --label-add api=true ip-172-31-30-41.eu-west-1.compute.internal
+	# 	@#docker node update --label-add database=true ip-172-31-30-41.eu-west-1.compute.internal
+	# 	@#docker node update --label-add web=true ip-172-31-25-206.eu-west-1.compute.internal
+	# 	@#
+	# 	@##check with 
+	# 	@##docker node inspect ip-172-31-30-41.eu-west-1.compute.internal
+
+}
+
+function _local-decomission { 
+	## Destroy swarm and overlays
+	_purge-networks;
+}
+
+function _local-build {
+	# echo "script parameters: $@ "
+	echo "Build LOCAL containers"
+	DOCKER_BUILDKIT=${DOCKER_BUILDKIT} docker-compose --env-file .envfile-local -f docker-compose.local.yaml build
+	echo "Finished building images."
+
+	echo "Security check image"
+
+	if [[ " $@ " =~ " --scan " ]]; then 
+		for CONTAINER in "${CONTAINERS_TO_BUILD[@]}";  do 
+			if [ -n "$(docker image ls | grep -F ${CONTAINER})"  ]; then 
+				docker scan "${CONTAINER}:${CONTAINERS_TO_BUILD_VERSION_TAG}"; 				
+			else 
+				echo "image ${CONTAINER}:${CONTAINERS_TO_BUILD_VERSION_TAG} FAILED to build."; 
+			fi; 
+		done;	
+	else
+		echo "To check for security add: --scan"	
+	fi
+
+}
+
+function _local-clean {
+	_local-down 
+	_purge-volumes 
+	_clean-images 
+	_purge-networks 
+	echo "LOCAL environment is clean"
+}
+function _local-up {
+	_local-provision
+	#  https://stackoverflow.com/questions/57406409/unsupported-compose-file-version-1-0-even-when-i-have-the-right-compatability
+	# https://github.com/docker/compose/issues/9306
+	# to keep the compatibility with compose we need to do 2 things:
+	# 1 - print the compose version
+	# 2 - remove the stack name from the file generated by config
+	(echo -e "version: '3.8'\n";  docker-compose --env-file .envfile-local -f docker-compose.local.yaml config) | sed "/published:/s/\"//g" | sed "s/^name:.*//"| docker stack deploy -c - local_${STACK_NAME} ; 
+
+	# docker-compose --env-file .envfile-local -f docker-compose.local.yaml config | docker stack deploy -c - local_${STACK_NAME} ; 
+}
+
+function _local-down {
+	echo "Undeploy ${STACK_NAME} stack"	
+	SWARM_STATUS=$(docker info | grep Swarm | cut -d " " -f 3)
+	if [ "${SWARM_STATUS}" = "active" ]; then 
+		docker stack rm local_${STACK_NAME}; 
+	else 
+		echo "skip undeploy, node is not swarm"; 
+	fi;
+	# _clean-networks
+}
+function _local-log {
+	. .envfile-local
+	echo "Check Dozzle: https://logs.${DOMAIN}"
+}
+function _local-debug {
+	(echo -e "version: '3.8'\n";  docker-compose --env-file .envfile-local -f docker-compose.local.yaml config) | sed "/published:/s/\"//g" | sed "s/^name:.*//"
+}
+
+# -----------------------------------------------------------------------------
+# STAGE environment functions
+# -----------------------------------------------------------------------------
+function env-stage { ## Configure the script targets to use STAGE setup 
+	echo "STAGE enviroment setup"
+	rm -f .error
+	envfiles=('.envfile-stage')
+	for f in $envfiles; do 
+		if [ ! -f ${f} ]; then
+			echo "[ERROR]: Missing required file ${f} file. Check the env.example and build one.";
+		touch .error; 
+		fi;
+    done;
+	
+	if [ -f ".error" ]; then exit 1; fi;
+
+	envfiles=('.envfile-stage' )
+	for f in $envfiles; do 
+		if [ $(cat "${f}" | wc -l | sed s/' '//g) -eq 0 ]; then  
+			echo "[ERROR]: file ${f} file is empty.";
+			touch .error; 
+		fi; 
+    done;
+	
+	# Finish configurtion ------------------------------------------------
+	if [ ! -f .error ]; then 
+		echo "STAGE" >  .porto; 
+		echo "STAGE environment configured successfuly."; 
+	else 
+		echo "STAGE environment configured FAILED."; 
+	fi;
+}
+
+function _stage-build {
+	# echo "script parameters: $@ "
+	echo "Build STAGE containers"
+	if [[ " $@ " =~ " --push" ]]; then 
+		echo "PUSH images after build"
+		PUSH_CMD="--push"; 
+		check-if-images-exists
+		# if there is no container to build, stop this task
+		if [ ! -f /tmp/porto-images.build ]; then 
+			echo "Images are already available in the Container Register, no need to build them."
+			return 0;	
+		fi 
+	else 
+		# push not selected
+		echo "Images will not be pushed. Only built."
+		PUSH_CMD=""; 
+	fi;
+
+	if [[ " $@ " =~ " --multiarch" ]]; then 
+		if [[ " $@ " =~ " --bake" ]]; then 
+			docker-compose --env-file .envfile-stage -c docker-compose.stage.yaml config | docker buildx bake --set "*.platform=linux/amd64,linux/arm64" ${PUSH_CMD} -f -
+		else
+			
+			# docker buildx build --platform "linux/amd64,linux/arm64" -f Dockerfile --push --tag "570160826209.dkr.ecr.eu-west-1.amazonaws.com/porto-traefik:ci-stage.c8e4a75" .
+			
+			MAX_IDX=$((${#CONTAINERS_TO_BUILD[*]} - 1))
+			# echo "max $MAX_IDX"
+			for CONTAINER_IDX in $(seq 0 ${MAX_IDX});  do 
+					# echo "CONTAINER_IDX $CONTAINER_IDX"
+					CONTAINER="${CONTAINERS_TO_BUILD[CONTAINER_IDX]}"
+					echo "============================================================================================="
+					echo "BUILDING CONTAINER: $CONTAINER"
+					echo "============================================================================================="
+					CONTAINER_PATH="${PATH_TO_CONTAINERS_TO_BUILD_CONTEXT[CONTAINER_IDX]}"
+					# echo "CONTAINER_PATH $CONTAINER_PATH"
+					ENVFILE=$(_container_to_envfile  "${CONTAINER}" stage)
+					DOCKER_ENV_ARGS=$(_envfile_to_docker_args "${ENVFILE}")
+					# echo "$DOCKER_ENV_ARGS"
+					# exit
+					# echo "building context: ${CONTAINER_PATH}"
+					cd "${CONTAINER_PATH}"
+					DOCKERFILE=$(_container_to_dockerfile  "${CONTAINER}" stage)
+					# echo "DOCKERFILE $DOCKERFILE"
+					# exit
+					CMD="docker buildx build $DOCKER_ENV_ARGS  --platform linux/amd64,linux/arm64 -f ${DOCKERFILE} ${PUSH_CMD} --tag ${CONTAINER}:${CONTAINERS_TO_BUILD_VERSION_TAG} ." 
+					echo "$CMD"
+					echo "--------------------------------------------------------------------------------------------"
+					# execute commands from stdin
+					echo "$CMD" | bash -
+					cd ..
+			done;	
+		fi
+	else
+		if [[ " $@ " =~ " --push" ]]; then 
+			echo "local build does not support push, use *save* command after build"; 
+			exit 1; 
+		fi
+		DOCKER_BUILDKIT=${DOCKER_BUILDKIT} docker-compose --env-file .envfile-stage -f docker-compose.stage.yaml build
+	fi # multiarch
+
+	echo "Finished building ${#CONTAINERS_TO_BUILD[*]} images: ${CONTAINERS_TO_BUILD[@]}"
+} 
+
+
+function _stage-undeploy {
+	echo "Undeploy ${STACK_NAME} stack"	
+	# validate that the swarm is ready before undeploy stack
+	echo "Undeploy ${STACK_NAME} stack"	
+	SWARM_STATUS=$(docker info | grep Swarm | cut -d " " -f 3)
+	if [ "${SWARM_STATUS}" = "active" ]; then 
+		docker stack rm stage_${STACK_NAME}; 
+	else 
+		echo "skip undeploy, node is not swarm"; 
+	fi;
+}
+
+# stop containers, remove volumes and networks for this stack
+function _stage-clean { 
+	_stage-undeploy 
+	_purge-volumes 
+	_clean-images 
+	_purge-networks 
+	echo "STAGE environment is clean"
+}
+
+function _stage-deploy {
+	echo "Deploy ${STACK_NAME} stack"
+	# validate that the swarm is ready before deploy stack
+	_check-stack
+
+	for CONTAINER in "${CONTAINERS_TO_BUILD[@]}";  do 
+		if [ -z "$(docker image ls | grep -F ${CONTAINER})"  ]; then 
+			echo "One of private images are not available, login to force pull from private register."
+			aws-login
+			echo "Login to private register done."
+			break
+		fi; 
+	done;
+
+
+	# ensure the context of containers exist otherwise it fails do
+	# deploy the stack. 
+	# see https://stackoverflow.com/questions/43354652/can-docker-compose-skip-build-if-the-image-is-present
+	for d in "${PATH_TO_CONTAINERS_TO_BUILD_CONTEXT}"; do
+		echo "Ensure context dir exists..."
+		mkdir -p ${d}
+	done; 
+
+	#  https://stackoverflow.com/questions/57406409/unsupported-compose-file-version-1-0-even-when-i-have-the-right-compatability
+	(echo -e "version: '3.8'\n";  docker-compose --env-file .envfile-stage -f docker-compose.stage.yaml config) | sed "/published:/s/\"//g" | sed "s/^name:.*//" | docker stack deploy --with-registry-auth -c - stage_${STACK_NAME} ; 
+	aws-logout
+}
+
+# print the resulting dockercompose file used to deploy the stack
+function _stage-debug {
+	(echo -e "version: '3.8'\n";  docker-compose --env-file .envfile-stage -f docker-compose.stage.yaml config ) | sed "/published:/s/\"//g"  | sed "s/^name:.*//"
+}
+
+# -----------------------------------------------------------------------------
+# PRODUCTION environment functions
+# -----------------------------------------------------------------------------
+function env-prod { ## Configure the script targets to use PRODUCTION setup 
+	echo "PRODUCTION enviroment setup"
+	rm -f .error
+	envfiles=('.envfile-prod')
+	for f in $envfiles; do 
+		if [ ! -f ${f} ]; then
+			echo "[ERROR]: Missing required file ${f} file. Check the env.example and build one.";
+		touch .error; 
+		fi;
+    done;
+	
+	if [ -f ".error" ]; then exit 1; fi;
+
+	envfiles=('.envfile-prod' )
+	for f in $envfiles; do 
+		if [ $(cat "${f}" | wc -l | sed s/' '//g) -eq 0 ]; then  
+			echo "[ERROR]: file ${f} file is empty.";
+			touch .error; 
+		fi; 
+    done;
+	
+	# Finish configurtion ------------------------------------------------
+	if [ ! -f .error ]; then 
+		echo "PRODUCTION" >  .porto; 
+		echo "PRODUCTION environment configured successfuly."; 
+	else 
+		echo "PRODUCTION environment configured FAILED."; 
+	fi;
+}
+
+# build locally (for manual deployment when Register is not available)
+# build multiarch
+# push to register
+# scan images
+function _prod-build {
+	# echo "script parameters: $@ "
+	echo "Build PRODUCTION containers"
+	if [[ " $@ " =~ " --push" ]]; then 
+		echo "PUSH images after build"
+		PUSH_CMD="--push"; 
+		check-if-images-exists
+		# if there is no container to build, stop this task
+		if [ ! -f /tmp/porto-images.build ]; then 
+			echo "Images are already available in the Container Register, no need to build them."
+			return 0;	
+		fi
+	else 
+		# push not selected
+		echo "Images will not be pushed. Only built."
+		PUSH_CMD=""; 
+	fi;
+
+	if [[ " $@ " =~ " --multiarch" ]]; then 
+		if [[ " $@ " =~ " --bake" ]]; then 
+			docker-compose --env-file .envfile-prod -c docker-compose.prod.yaml config | docker buildx bake --set "*.platform=linux/amd64,linux/arm64" ${PUSH_CMD} -f -
+		else
+			
+			# docker buildx build --platform "linux/amd64,linux/arm64" -f Dockerfile --push --tag "570160826209.dkr.ecr.eu-west-1.amazonaws.com/porto-traefik:ci-prod.c8e4a75" .
+			
+			MAX_IDX=$((${#CONTAINERS_TO_BUILD[*]} - 1))
+			# echo "max $MAX_IDX"
+			for CONTAINER_IDX in $(seq 0 ${MAX_IDX});  do 
+					# echo "CONTAINER_IDX $CONTAINER_IDX"
+					CONTAINER="${CONTAINERS_TO_BUILD[CONTAINER_IDX]}"
+					echo "============================================================================================="
+					echo "BUILDING CONTAINER: $CONTAINER"
+					echo "============================================================================================="
+					CONTAINER_PATH="${PATH_TO_CONTAINERS_TO_BUILD_CONTEXT[CONTAINER_IDX]}"
+					# echo "CONTAINER_PATH $CONTAINER_PATH"
+					ENVFILE=$(_container_to_envfile  "${CONTAINER}" prod)
+					DOCKER_ENV_ARGS=$(_envfile_to_docker_args "${ENVFILE}")
+					# echo "$DOCKER_ENV_ARGS"
+					# exit
+					# echo "building context: ${CONTAINER_PATH}"
+					cd "${CONTAINER_PATH}"
+					DOCKERFILE=$(_container_to_dockerfile  "${CONTAINER}" prod)
+					# echo "DOCKERFILE $DOCKERFILE"
+					# exit
+					CMD="docker buildx build $DOCKER_ENV_ARGS  --platform linux/amd64,linux/arm64 -f ${DOCKERFILE} ${PUSH_CMD} --tag ${CONTAINER}:${CONTAINERS_TO_BUILD_VERSION_TAG} ." 
+					echo "$CMD"
+					echo "--------------------------------------------------------------------------------------------"
+					# execute commands from stdin
+					echo "$CMD" | bash -
+					cd ..
+			done;	
+		fi
+	else
+		if [[ " $@ " =~ " --push" ]]; then 
+			echo "local build does not support push, use *save* command after build"; 
+			exit 1; 
+		fi
+		DOCKER_BUILDKIT=${DOCKER_BUILDKIT} docker-compose --env-file .envfile-prod -f docker-compose.prod.yaml build
+	fi # multiarch
+
+	echo "Finished building ${#CONTAINERS_TO_BUILD[*]} images: ${CONTAINERS_TO_BUILD[@]}"
+} 
+
+function _prod-undeploy {
+	echo "Undeploy ${STACK_NAME} stack"	
+	# validate that the swarm is ready before undeploy stack
+	echo "Undeploy ${STACK_NAME} stack"	
+	SWARM_STATUS=$(docker info | grep Swarm | cut -d " " -f 3)
+	if [ "${SWARM_STATUS}" = "active" ]; then 
+	docker stack rm prod_${STACK_NAME}; 
+	else 
+		echo "skip undeploy, node is not swarm"; 
+	fi;
+}
+
+# stop containers, remove volumes and networks for this stack
+function _prod-clean { 
+	_prod-undeploy 
+	_purge-volumes 
+	_clean-images 
+	_purge-networks 
+	echo "PRODUCTION environment is clean"
+}
+
+
+function _prod-deploy {
+	echo "Deploy ${STACK_NAME} stack"	
+	# validate that the swarm is ready before deploy stack
+	_check-stack	
+	for CONTAINER in "${CONTAINERS_TO_BUILD[@]}";  do 
+		if [ -z "$(docker image ls | grep -F ${CONTAINER})"  ]; then 
+			echo "One of private images are not available, login to force pull from private register."
+			aws-login
+			echo "Login to private register done."
+			break
+		fi; 
+	done;
+
+
+	# ensure the context of containers exist otherwise it fails do
+	# deploy the stack. 
+	# see https://stackoverflow.com/questions/43354652/can-docker-compose-skip-build-if-the-image-is-present
+	for d in "${PATH_TO_CONTAINERS_TO_BUILD_CONTEXT}"; do
+		echo "Ensure context dir exists..."
+		mkdir -p ${d}
+	done; 
+
+	#  https://stackoverflow.com/questions/57406409/unsupported-compose-file-version-1-0-even-when-i-have-the-right-compatability
+	(echo -e "version: '3.8'\n";  docker-compose --env-file .envfile-prod -f docker-compose.prod.yaml config) | sed "/published:/s/\"//g" | sed "s/^name:.*//" | docker stack deploy --with-registry-auth -c - prod_${STACK_NAME} ; 
+	aws-logout
+}
+
+# print the resulting dockercompose file used to deploy the stack
+function _prod-debug {
+	# docker-compose --env-file .envfile-prod -f docker-compose.prod.yaml config
+	(echo -e "version: '3.8'\n";  docker-compose --env-file .envfile-prod -f docker-compose.prod.yaml config ) | sed "/published:/s/\"//g"  | sed "s/^name:.*//"
+
+}
+
+function _prod_retag {
+	echo "CONTAINER_TAG=${CONTAINER_TAG}"
+	echo "CONTAINER_RELEASE_TAG=${CONTAINER_RELEASE_TAG}"
+
+	for IMAGE in "${CONTAINERS_TO_BUILD[@]}"; do
+		# echo "IMAGE: $IMAGE"
+		# remove registry prefix
+		IMAGE="${IMAGE#$REGISTER/}"
+		# echo "IMAGE: $IMAGE"
+		MANIFEST=$(aws ecr batch-get-image --repository-name ${IMAGE} --image-ids imageTag=${CONTAINER_TAG} --output json | jq --raw-output --join-output '.images[0].imageManifest')
+		echo "========================================================================================"
+		echo "Tagging ${IMAGE}: ${CONTAINER_TAG} --> ${CONTAINER_RELEASE_TAG}"
+		# echo "----------------------------------------------------------------------------------------"
+		# echo "$MANIFEST"
+		echo "========================================================================================"
+		aws ecr put-image --repository-name "${IMAGE}" --image-tag "${CONTAINER_RELEASE_TAG}" --image-manifest "$MANIFEST"
+	done;
+}
+################################################################################
+# Public targets
+################################################################################
+
+# rebuild: clean build up
+function build { ## Build all containers ARGS: '[--push --local --multiarch [--bake]]'
+	ENVIRONMENT=$(cat .porto)
+	if [ "${ENVIRONMENT}" = 'DEVELOPMENT' ]; then 
+		_dev-build "$@"; 
+	elif [ "${ENVIRONMENT}" = 'LOCAL' ]; then 
+		_local-build "$@"; 
+	elif [ "${ENVIRONMENT}" = 'STAGE' ]; then 
+		_stage-build "$@"; 
+	elif [ "${ENVIRONMENT}" = 'PRODUCTION' ]; then 
+		_prod-build "$@"; 
+	else 
+		echo "Environment target is not defined yet"; 
+	fi
+}
+
+function clean { ## Remove all resources
+	ENVIRONMENT=$(cat .porto)
+	if [ "${ENVIRONMENT}" = 'DEVELOPMENT' ]; then 
+		_dev-clean; 
+	elif [ "${ENVIRONMENT}" = 'LOCAL' ]; then 
+		_local-clean; 
+	elif [ "${ENVIRONMENT}" = 'STAGE' ]; then 
+		_stage-clean; 
+	elif [ "${ENVIRONMENT}" = 'PRODUCTION' ]; then 
+		_prod-clean; 
+	else 
+		echo "Environment target is not defined yet"; 
+	fi	
+}
+
+function purge { ## Remove all resources (using regex - careful)
+	_purge-volumes 
+	_purge-networks 
+	_purge-images 
+	# remove saved containers
+	for CONTAINER in "${CONTAINERS_TO_BUILD[@]}";  do 
+		CONTAINER_NAME=$(_container-name ${CONTAINER});
+		if [ -f "containers/${CONTAINER_NAME}.tar"  ]; then 
+			echo "REMOVING containers/${CONTAINER_NAME}.tar"
+			rm -f containers/${CONTAINER_NAME}.tar; 
+		else 
+			echo "file containers/${CONTAINER_NAME}.tar is already removed."; 
+		fi; 
+	done;
+}
+
+function up { ## Startup the stack (Development)
+	ENVIRONMENT=$(cat .porto)
+	if [ "${ENVIRONMENT}" = 'DEVELOPMENT' ]; then
+		_dev-up;
+	elif [ "${ENVIRONMENT}" = 'LOCAL' ]; then
+		_local-up "$@";
+	elif [ "${ENVIRONMENT}" = 'STAGE' ]; then
+		echo "Stage environment calls make *deploy* instead." ;
+	elif [ "${ENVIRONMENT}" = 'PRODUCTION' ]; then
+		echo "Production environment calls make *deploy* instead." ;
+	else
+		echo "Environment target is not defined yet";
+	fi	
+}
+
+function down { ## Stop and remove resources (Development)
+	ENVIRONMENT=$(cat .porto)
+	if [ "${ENVIRONMENT}" = 'DEVELOPMENT' ]; then
+		_dev-down;
+	elif [ "${ENVIRONMENT}" = 'LOCAL' ]; then
+		_local-down;
+	elif [ "${ENVIRONMENT}" = 'STAGE' ]; then
+		echo "Stage environment calls *undeploy* instead." ;
+	elif [ "${ENVIRONMENT}" = 'PRODUCTION' ]; then
+		echo "Production environment calls *undeploy* instead." ;
+	else
+		echo "Environment target is not defined yet"; 
+	fi	
+}
+# function pause { ## Pause the local stack
+# 	ENVIRONMENT=$(cat .porto)
+# 	if [ "${ENVIRONMENT}" = 'DEVELOPMENT' ]; then
+# 		make dev-pause;
+# 	elif [ "${ENVIRONMENT}" = 'LOCAL' ]; then
+# 		echo "NOT IMPLEMENTED YET" ;
+# 	elif [ "${ENVIRONMENT}" = 'PRODUCTION' ]; then
+# 		echo "Production environment has no pause command." ;
+# 	elif [ "${ENVIRONMENT}" = 'STAGE' ]; then
+# 		echo "Stage environment has no pause command." ;
+# 	else
+# 		echo "Environment target is not defined yet";
+# 	fi	
+# }
+# function continue { ## Continue the execution of a paused local stack
+# 	ENVIRONMENT=$(cat .porto)
+# 	if [ "${ENVIRONMENT}" = 'DEVELOPMENT' ]; then
+# 		make dev-continue;
+# 	elif [ "${ENVIRONMENT}" = 'LOCAL' ]; then
+# 		echo "NOT IMPLEMENTED YET" ;
+# 	elif [ "${ENVIRONMENT}" = 'PRODUCTION' ]; then
+# 		echo "Production environment has no continue command." ;
+# 	elif [ "${ENVIRONMENT}" = 'STAGE' ]; then
+# 		echo "Stage environment has no pause command." ;
+# 	else
+# 		echo "Environment target is not defined yet";
+# 	fi	
+# }
+
+function deploy { ## Startup the distributed stack (Production)
+	ENVIRONMENT=$(cat .porto)
+	if [ "${ENVIRONMENT}" = 'DEVELOPMENT' ]; then
+		echo "Development environment calls *up* instead." ;
+	elif [ "${ENVIRONMENT}" = 'LOCAL' ]; then
+		echo "Local environment calls *up* instead." ;
+	elif [ "${ENVIRONMENT}" = 'STAGE' ]; then
+		_stage-deploy ;
+	elif [ "${ENVIRONMENT}" = 'PRODUCTION' ]; then
+		_prod-deploy ;
+	else
+		echo "Environment target is not defined yet";
+	fi	
+}
+
+function undeploy { ## Bring down the distributed stack (Production)
+	ENVIRONMENT=$(cat .porto)
+	if [ "${ENVIRONMENT}" = 'DEVELOPMENT' ]; then
+		echo "Development environment calls *down* instead." ;
+	elif [ "${ENVIRONMENT}" = 'LOCAL' ]; then
+		echo "LOCAL environment calls *down* instead." ;
+	elif [ "${ENVIRONMENT}" = 'STAGE' ]; then
+		_stage-undeploy ;
+	elif [ "${ENVIRONMENT}" = 'PRODUCTION' ]; then
+		_prod-undeploy ;
+	else
+		echo "Environment target is not defined yet";
+	fi	
+}
+
+function save { ## Export containers
+	# echo Caching remote containers 
+
+	echo "Exporting containers"
+	mkdir -p containers
+	for CONTAINER in "${CONTAINERS_TO_BUILD[@]}";  do 
+		echo "Archiving ${CONTAINER}:${CONTAINERS_TO_BUILD_VERSION_TAG}..."; 
+		CONTAINER_NAME=$(_container-name ${CONTAINER});
+		docker save ${CONTAINER}:${CONTAINERS_TO_BUILD_VERSION_TAG} -o containers/${CONTAINER_NAME}.tar ; 
+		echo "Container [containers/${CONTAINER_NAME}.tar] saved."
+	done; 
+	echo "Done."
+}
+
+function load {  ## Load containers
+	for CONTAINER in "${CONTAINERS_TO_BUILD[@]}";  do 
+		CONTAINER_NAME=$(_container-name ${CONTAINER});
+		if [ -f "containers/${CONTAINER_NAME}.tar" ]; then 
+			docker load --input "containers/${CONTAINER_NAME}.tar"; 
+		else 
+			echo "Container image file containers/${CONTAINER_NAME}.tar is not built, skipping." ;
+		fi 
+	done;
+}
+
+function debug { ## Output the resulting docker configuration after loading vars and compose files
+	ENVIRONMENT=$(cat .porto)
+	if [ "${ENVIRONMENT}" = 'DEVELOPMENT' ]; then 
+		_dev-debug ; 
+	elif [ "${ENVIRONMENT}" = 'LOCAL' ]; then 
+		_local-debug ; 
+	elif [ "${ENVIRONMENT}" = 'STAGE' ]; then
+		_stage-debug ;
+	elif [ "${ENVIRONMENT}" = 'PRODUCTION' ]; then
+		_prod-debug ;
+	else
+		echo "Environment target is not defined yet";
+	fi;
+	echo "Environment: ${ENVIRONMENT} | STACK ${STACK_NAME}";
+}
+
+function log { ## attach to the log output
+	ENVIRONMENT=$(cat .porto)
+	if [ "${ENVIRONMENT}" = 'DEVELOPMENT' ]; then
+		_dev-log;
+	elif [ "${ENVIRONMENT}" = 'LOCAL' ]; then
+		_local-log ;
+	elif [ "${ENVIRONMENT}" = 'STAGE' ]; then
+		echo "Stage environment no log command" ;
+	elif [ "${ENVIRONMENT}" = 'PRODUCTION' ]; then
+		echo "Production environment no log command" ;
+	else
+		echo "Environment target is not defined yet";
+	fi	
+}
+
+function status {
+	if [ ! -f .porto ]; then 
+		echo "Environment not configured yet." ;
+		exit
+	fi;
+
+	ENVIRONMENT=$(cat .porto) 
+	echo "Environment: ${ENVIRONMENT} | STACK ${STACK_NAME}" ;	
+}
+
+function ps { ## print the sevices of the stack
+	ENVIRONMENT=$(cat .porto)
+	SWARM_STATUS=$(docker info | grep Swarm | cut -d " " -f 3)
+
+	if [ "${ENVIRONMENT}" = 'DEVELOPMENT' ]; then
+		docker-compose --env-file .envfile-dev -f docker-compose.dev.yaml ps ;
+	elif [ "${ENVIRONMENT}" = 'LOCAL' ] || [ "${ENVIRONMENT}" = 'PRODUCTION' ] || [ "${ENVIRONMENT}" = 'STAGE' ]; then
+		if [  "${SWARM_STATUS}" = "active" ]; then
+			docker service ls ;
+		else
+			echo "Not possible to check containers for ${ENVIRONMENT}, Swarm is not active.";
+		fi;
+	else
+		echo "Environment target is not defined yet";
+	fi;
+}
+
+# -----------------------------------------------------------------------------
+# Helper functions must be at the end of the file to read the whole context
+# -----------------------------------------------------------------------------
+# function help {
+#   printf "%s <task> [args]\n\nTasks:\n" "${0}"
+
+#   compgen -A function | grep -v "^_" | cat -n
+
+#   printf "\nExtended help:\n  Each task has comments for general usage\n"
+# }
+
+function help { ## Display usage for this application
+    echo "$0 <task> <args>"
+    grep -E '^function [a-zA-Z_-]+ {.*?## .*$$' $0 | sed -e 's/function //' | sort | awk 'BEGIN {FS = "{.*?## "}; {printf "\033[93m%-30s\033[92m %s\033[0m\n", $1, $2}'
+}
+
+
+# This idea is heavily inspired by: https://github.com/adriancooney/Taskfile
+TIMEFORMAT=$'\nTask completed in %3lR'
+time "${@:-help}"

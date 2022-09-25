@@ -1,0 +1,308 @@
+version: "3.8"
+
+networks:
+  net_traefik:
+    name: net_traefik
+    driver: bridge
+  net_backend:
+    name: net_backend
+    driver: bridge
+  net_portainer:
+    name: net_portainer
+    driver: bridge
+
+volumes:
+  vol_portainer: 
+  vol_gateway_certs: 
+  vol_storage:
+  vol_postgres:
+  vol_redis:
+
+services:
+#----------------------------------------------------------------------------------
+# reverse proxy
+#----------------------------------------------------------------------------------
+  gateway:
+    image: ${REGISTER}/traefik:${CONTAINER_TAG:-latest}
+    build:
+      context: ./traefik
+      dockerfile: Dockerfile
+      args:
+        TRAEFIK_BASE: "${TRAEFIK_BASE}"
+    restart: unless-stopped
+        
+    # for the local and dev environments, we need to devine aliases for the service hostnames
+    # to force them using the proxy. That's because using the vcap.me resolves to localhost
+    # and therefore when the webapp/store tries to contact the api via api.porto.vcap.me
+    # the dnsclient resolves to the same container and prevent accessing the right one.
+    # that is a temporary fix that can be replaced later with a service mesh
+    # NOT REQUIRED FOR STAGE/PROD as the FQDNs are valid and maps to different servers
+    networks:
+      net_traefik:
+        aliases: # allow for internal services in different stacks to access the container by fqdn
+          - mail.${DOMAIN}
+
+    # ports:
+    #   - 80:80
+    #   - 443:443
+    #   - 33322:33322
+    #   - 25:1025
+    # we need to expose ports explicitally so that the client ip are captured by traefik
+    # more here: https://dockerswarm.rocks/traefik/#getting-the-client-ip
+    ports:
+      - target: 80 
+        published: 80 
+        mode: host 
+      - target: 443
+        published: 443 
+        mode: host 
+      - 25:1025 # only internal/testing
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./certs:/certs
+    security_opt:
+      - no-new-privileges=true # https://docs.docker.com/engine/reference/run/#security-configuration
+    environment:
+      - TRAEFIK_PASSWORD_HASH
+      - DEPLOYMENT_TYPE
+      - TRAEFIK_USER
+      - DOMAIN
+
+#----------------------------------------------------------------------------------
+# whoami testing service
+#----------------------------------------------------------------------------------
+  # whoami:
+  #   image: "containous/whoami"
+  #   container_name: "whoami"
+  #   networks:
+  #     - net_traefik
+  #   labels:
+  #     - traefik.enable=true
+  #     - traefik.docker.network=net_traefik  # required when container connects to more than one network
+  #     - traefik.http.services.whoami.loadbalancer.server.port=80
+  #     - traefik.http.routers.whoami.rule=Host(`whoami.${DOMAIN}`)
+  #     - traefik.http.routers.whoami.tls=true
+  #     - traefik.http.routers.whoami.entrypoints=websecure
+
+
+#----------------------------------------------------------------------------------
+# monitor service
+#----------------------------------------------------------------------------------
+  agent:
+    image: portainer/agent:2.15.0-alpine
+    environment:
+      AGENT_CLUSTER_ADDR: agent
+      AGENT_PORT: 9001
+      LOG_LEVEL: DEBUG
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+    networks:
+      - net_portainer
+
+  # the following pointers are relevant for configuring portainer
+  # https://documentation.portainer.io/archive/1.23.2/configuration/
+  # https://stackoverflow.com/questions/42139605/how-do-you-manage-secret-values-with-docker-compose-v3-1
+  # https://github.com/portainer/portainer/issues/1506
+  portainer:
+    image: portainer/portainer-ce:2.15.0-alpine
+    command: -H tcp://agent:9001 --tlsskipverify --admin-password=${PORTAINER_PASSWORD_HASH}
+    volumes: 
+      - vol_portainer:/data
+    environment:
+      - PORTAINER_PASSWORD_HASH
+      - DOMAIN  
+    # ports:
+    #   - "9000:9000"
+    #   - "8000:8000"
+    networks:
+      - net_traefik
+      - net_portainer
+    labels:
+        - traefik.enable=true
+        - traefik.docker.network=net_traefik  # required when container connects to more than one network
+        - traefik.http.services.to-portainer.loadbalancer.server.port=9000
+        - traefik.http.routers.to-portainer.rule=Host(`portainer.${DOMAIN}`)
+        - traefik.http.routers.to-portainer.tls=true
+        - traefik.http.routers.to-portainer.entrypoints=websecure
+
+    depends_on:
+      - agent
+
+#----------------------------------------------------------------------------------
+# light logviewer service
+#----------------------------------------------------------------------------------
+
+  dozzle:
+    image: amir20/dozzle:latest
+    command: --no-analytics
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOZZLE_LEVEL
+      - DOZZLE_TAILSIZE
+      - DOZZLE_AUTH
+      - DOMAIN  
+    networks:
+      - net_traefik
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=net_traefik  # required when container connects to more than one network
+      - traefik.http.services.to-dozzle.loadbalancer.server.port=8080
+      - traefik.http.routers.to-dozzle.rule=Host(`logs.${DOMAIN}`)
+      - traefik.http.routers.to-dozzle.tls=true
+      - traefik.http.routers.to-dozzle.entrypoints=websecure
+      - traefik.http.routers.to-dozzle.middlewares=to-dozzle-handler
+      - traefik.http.middlewares.to-dozzle-handler.chain.middlewares=to-dozzle-auth
+      - traefik.http.middlewares.to-dozzle-auth.basicauth.users=${DOZZLE_AUTH}
+
+#----------------------------------------------------------------------------------
+# email dev service
+#----------------------------------------------------------------------------------
+
+  mailhog:
+    # image: mailhog/mailhog:v1.0.1 # no arm image available
+    image: jcalonso/mailhog:v1.0.1
+    networks:
+      net_traefik:
+        aliases:
+          - mail.${DOMAIN}
+    # ports: 
+    #    - 8025:8025 # web ui
+    #    - 1025:1025 # smtp server
+
+    labels: 
+      - traefik.enable=true
+      - traefik.docker.network=net_traefik  # required when container connects to more than one network
+      - traefik.http.routers.mailhog.tls=true
+      - traefik.http.routers.mailhog.entrypoints=websecure
+      - traefik.http.routers.mailhog.rule=Host(`mail.${DOMAIN}`)
+      - traefik.http.routers.mailhog.service=mailhog 
+      - traefik.http.services.mailhog.loadbalancer.server.port=8025
+        # - traefik.http.routers.mailhog.middlewares=to-mailhog-handler
+        # - traefik.http.middlewares.to-mailhog-handler.chain.middlewares=to-mailhog-auth
+        # - traefik.http.middlewares.to-mailhog-auth.basicauth.users=${MAILHOG_AUTH}
+
+      - traefik.tcp.routers.smtp.tls=false 
+      - traefik.tcp.routers.smtp.entrypoints=smtp
+      - traefik.tcp.routers.smtp.rule=HostSNI(`*`)
+      - traefik.tcp.routers.smtp.service=smtp
+      - traefik.tcp.services.smtp.loadbalancer.server.port=1025
+
+#----------------------------------------------------------------------------------
+# OUTLINE dev service
+#----------------------------------------------------------------------------------
+# https://www.blackvoid.club/outline-wiki-for-growing-teams/
+# https://github.com/outline/outline/discussions/3437
+# https://app.getoutline.com/s/770a97da-13e5-401e-9f8a-37949c19f97e/doc/smtp-cqCJyZGMIB
+# https://github.com/outline/outline/blob/main/.env.sample
+# https://blog.gurucomputing.com.au/doing-more-with-docker/deploying-outline-wiki/
+# S3 configuration ----------------------------------------------------------------
+  storage:
+    image: minio/minio
+    # ports:
+    # api
+      # - "9000:9000"
+    # web interface
+      # - "9001:9001"
+    environment:
+      - MINIO_ROOT_PASSWORD
+      - MINIO_ROOT_USER
+    entrypoint: sh
+    command: -c 'minio server /data --console-address ":9001"'
+    networks:
+      - net_traefik
+      - net_backend
+    deploy:
+      restart_policy:
+        condition: on-failure
+    volumes:
+      - vol_storage:/data
+    labels: 
+      - traefik.enable=true
+      - traefik.docker.network=net_traefik  # required when container connects to more than one network
+      - traefik.http.routers.minio.tls=true
+      - traefik.http.routers.minio.entrypoints=websecure
+      - traefik.http.routers.minio.rule=Host(`minio.${DOMAIN}`)
+      - traefik.http.routers.minio.service=minio 
+      - traefik.http.services.minio.loadbalancer.server.port=9001
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://storage:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # provision minio
+  # https://github.com/minio/minio/issues/4769
+  createbuckets:
+    image: minio/mc
+    networks:
+      - net_backend
+    depends_on:
+      - storage
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      /usr/bin/mc config host add myminio http://storage:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      /usr/bin/mc rm -r --force myminio/${AWS_S3_UPLOAD_BUCKET_NAME};
+      /usr/bin/mc mb myminio/${AWS_S3_UPLOAD_BUCKET_NAME};
+      /usr/bin/mc policy set download myminio/${AWS_S3_UPLOAD_BUCKET_NAME};
+      exit 0;
+      "
+
+# Postgres configuration ----------------------------------------------------------
+  postgres:
+      image: postgres
+      networks:
+        - net_backend
+      # ports:
+      #   - "5432:5432"
+      environment:
+        - POSTGRES_PASSWORD
+        - POSTGRES_USER
+        - POSTGRES_DB
+      volumes:
+        - vol_postgres:/var/lib/postgresql/data
+      healthcheck:
+        test: ["CMD", "pg_isready -U outline"]
+        interval: 30s
+        timeout: 20s
+        retries: 3
+
+# Redis configuration -------------------------------------------------------------
+  redis:
+    image: redis:6.2.5-buster
+    volumes:
+      - vol_redis:/data
+    networks:
+      - net_backend
+    # ports:
+    #   - 6379:6379
+    # command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+
+# Outline configuration -----------------------------------------------------------
+
+
+  outline:
+    image: outlinewiki/outline:0.66.1
+    env_file: .envfile-dev
+    command: sh -c "yarn sequelize:migrate --env production-ssl-disabled && yarn start"
+    ports:
+      - "3000:3000"
+    networks:
+      - net_traefik
+      - net_backend
+    labels: 
+      - traefik.enable=true
+      - traefik.docker.network=net_traefik  # required when container connects to more than one network
+      - traefik.http.routers.outline.tls=true
+      - traefik.http.routers.outline.entrypoints=websecure
+      - traefik.http.routers.outline.rule=Host(`outline.${DOMAIN}`)
+      - traefik.http.routers.outline.service=outline 
+      - traefik.http.services.outline.loadbalancer.server.port=3000
+
+    depends_on:
+      - postgres
+      - redis
+      - storage

@@ -1,0 +1,30 @@
+## DYNAMIC CONFIG
+
+http:
+  routers:
+    to-dashboard:
+      service: api@internal
+      rule: Host(`traefik.{{ env "DOMAIN" }}`) && (PathPrefix(`/api`) || PathPrefix(`/dashboard`))
+      entrypoints:
+        - websecure
+      middlewares:
+        - auth
+      tls:
+        domains:
+          - main: "docker.localhost"
+            sans:
+              - "*.docker.localhost"
+          - main: "{{ env "DOMAIN" }}"
+            sans:
+              - "*.{{ env "DOMAIN" }}"
+  
+  middlewares:
+    auth:
+      basicAuth:
+        users:
+          - {{ env "TRAEFIK_USER" }}:{{ env "TRAEFIK_PASSWORD_HASH" }}
+  
+tls:
+  certificates:
+    - certFile: '/certs/{{ env "DOMAIN" }}/{{ env "DOMAIN" }}.pem'
+      keyFile: '/certs/{{ env "DOMAIN" }}/{{ env "DOMAIN" }}.pem'
